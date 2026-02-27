@@ -3,7 +3,7 @@ import sys
 from collections import defaultdict
 from typing import List
 from unittest import mock
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -39,6 +39,7 @@ from ray.serve._private.test_utils import (
 )
 from ray.serve.config import GangSchedulingConfig
 from ray.serve.tests.unit.test_deployment_state import (
+    TEST_DEPLOYMENT_ID,
     check_counts,
     deployment_info,
 )
@@ -2102,9 +2103,16 @@ class TestScaleDeploymentGangReplicas:
         dsm.deploy(deployment_id, info)
         ds = dsm._deployment_states[deployment_id]
 
+        gang_ids = ["gang_0", "gang_1"]
+        gang_pg_names = ["SERVE_GANG::pg-0", "SERVE_GANG::pg-1"]
         dsm._deployment_scheduler.schedule_gang_placement_groups = Mock(
             return_value={
-                deployment_id: GangReservationResult(success=True, gang_pgs=gang_pgs)
+                deployment_id: GangReservationResult(
+                    success=True,
+                    gang_pgs=gang_pgs,
+                    gang_ids=gang_ids,
+                    gang_pg_names=gang_pg_names,
+                )
             }
         )
 
@@ -2281,6 +2289,188 @@ class TestScaleDeploymentGangReplicas:
             by_state=[(ReplicaState.RUNNING, target_replicas, version)],
         )
         assert ds.curr_status_info.status == DeploymentStatus.HEALTHY
+
+
+class TestGangHealthCheck:
+    def _deploy_gang(self, mock_deployment_state_manager, gang_size, num_replicas):
+        """Deploy gang-scheduled replicas and wait for them to become RUNNING."""
+        create_dsm, _, _, _ = mock_deployment_state_manager
+        dsm: DeploymentStateManager = create_dsm(
+            create_placement_group_fn_override=lambda *args, **kwargs: MockPlacementGroup(
+                *args, **kwargs
+            ),
+        )
+        b_info, v1 = deployment_info(
+            version="1",
+            num_replicas=num_replicas,
+            gang_scheduling_config=GangSchedulingConfig(gang_size=gang_size),
+        )
+        dsm.deploy(TEST_DEPLOYMENT_ID, b_info)
+        ds = dsm._deployment_states[TEST_DEPLOYMENT_ID]
+
+        # Reserves gang PGs and creates replicas
+        dsm.update()
+        check_counts(
+            ds, total=num_replicas, by_state=[(ReplicaState.STARTING, num_replicas, v1)]
+        )
+
+        # Capture replica references and wait for them to become RUNNING
+        replicas = ds._replicas.get()
+        for replica in replicas:
+            replica._actor.set_ready()
+        dsm.update()
+
+        check_counts(
+            ds, total=num_replicas, by_state=[(ReplicaState.RUNNING, num_replicas, v1)]
+        )
+        assert ds.curr_status_info.status == DeploymentStatus.HEALTHY
+
+        # Group captured replicas by gang
+        gangs = {}
+        for r in replicas:
+            assert r.gang_context is not None
+            gangs.setdefault(r.gang_context.gang_id, []).append(r)
+
+        return dsm, ds, v1, gangs
+
+    def test_restart_gang_entire_gang_stopped(self, mock_deployment_state_manager):
+        """Unhealthy gang is force-stopped; healthy gangs are unaffected."""
+        gang_size = 2
+        num_replicas = 4
+        num_gangs = num_replicas // gang_size
+        dsm, ds, v1, gangs = self._deploy_gang(
+            mock_deployment_state_manager, gang_size, num_replicas
+        )
+        assert len(gangs) == num_gangs
+
+        gang_ids = list(gangs.keys())
+        target_gang = gangs[gang_ids[0]]
+        healthy_gang = gangs[gang_ids[1]]
+
+        # Initialize health checks, then mark one replica in the target gang as unhealthy.
+        dsm.update()
+        target_gang[0]._actor.set_unhealthy()
+        dsm.update()
+
+        # Both replicas of the affected gang should be stopping (force-stopped).
+        check_counts(
+            ds,
+            total=num_replicas,
+            by_state=[
+                (ReplicaState.RUNNING, gang_size, v1),
+                (ReplicaState.STOPPING, gang_size, v1),
+            ],
+        )
+        for r in target_gang:
+            assert r._actor.force_stopped_counter == 1
+
+        # Healthy gang replicas should still be running.
+        for r in healthy_gang:
+            assert r._actor.force_stopped_counter == 0
+
+        assert ds.curr_status_info.status == DeploymentStatus.UNHEALTHY
+
+        # After the stopped replicas finish stopping, new replicas should start.
+        for r in target_gang:
+            r._actor.set_done_stopping()
+        dsm.update()
+        check_counts(
+            ds,
+            total=num_replicas,
+            by_state=[
+                (ReplicaState.RUNNING, gang_size, v1),
+                (ReplicaState.STARTING, gang_size, v1),
+            ],
+        )
+
+    def test_restart_gang_force_stop_all_gang_replicas(
+        self, mock_deployment_state_manager
+    ):
+        """RESTART_GANG force-stops all gang members regardless of the flag."""
+        gang_size = 2
+        num_replicas = 4
+        num_gangs = num_replicas // gang_size
+        dsm, ds, v1, gangs = self._deploy_gang(
+            mock_deployment_state_manager, gang_size, num_replicas
+        )
+        assert len(gangs) == num_gangs
+
+        gang_replicas = list(gangs.values())[0]
+        assert len(gang_replicas) == gang_size
+
+        ds.FORCE_STOP_UNHEALTHY_REPLICAS = False
+
+        dsm.update()
+        gang_replicas[0]._actor.set_unhealthy()
+        dsm.update()
+
+        check_counts(
+            ds,
+            total=num_replicas,
+            by_state=[
+                (ReplicaState.RUNNING, num_replicas - gang_size, v1),
+                (ReplicaState.STOPPING, gang_size, v1),
+            ],
+        )
+        for r in gang_replicas:
+            assert r._actor.force_stopped_counter == 1
+
+
+class TestGangPGLeakDetection:
+    def test_gang_pg_with_alive_actors(self, mock_deployment_state_manager):
+        """Gang PGs with alive actors are not removed."""
+        create_dsm, _, _, _ = mock_deployment_state_manager
+
+        gang_pg_name = "SERVE_GANG::test_gang_1"
+        gang_pg_id = "pg_id_abc"
+
+        # Leak detection runs during DSM construction (recovery path).
+        # Mock ray utilities so the gang PG appears occupied by an actor.
+        with patch(
+            "ray.util.placement_group_table",
+            return_value={gang_pg_id: {"name": gang_pg_name}},
+        ) as mock_pg_table, patch(
+            "ray.serve._private.deployment_state.get_active_placement_group_ids",
+            return_value={gang_pg_id},
+        ), patch(
+            "ray.util.get_placement_group"
+        ), patch(
+            "ray.util.remove_placement_group"
+        ) as mock_remove_pg:
+            create_dsm(placement_group_names=[gang_pg_name])
+
+        # Verify the leak detection path was entered.
+        mock_pg_table.assert_called_once()
+        mock_remove_pg.assert_not_called()
+
+    def test_gang_pg_without_alive_actors(self, mock_deployment_state_manager):
+        """Leaked gang PGs are removed; PGs with alive actors are kept."""
+        create_dsm, _, _, _ = mock_deployment_state_manager
+
+        leaked_pg_name = "SERVE_GANG::test_gang_leaked"
+        alive_pg_name = "SERVE_GANG::test_gang_alive"
+        leaked_pg_id = "pg_id_leaked"
+        alive_pg_id = "pg_id_alive"
+
+        mock_pg_obj = object()
+        with patch(
+            "ray.util.placement_group_table",
+            return_value={
+                leaked_pg_id: {"name": leaked_pg_name},
+                alive_pg_id: {"name": alive_pg_name},
+            },
+        ), patch(
+            "ray.serve._private.deployment_state.get_active_placement_group_ids",
+            return_value={alive_pg_id},
+        ), patch(
+            "ray.util.get_placement_group", return_value=mock_pg_obj
+        ) as mock_get_pg, patch(
+            "ray.util.remove_placement_group"
+        ) as mock_remove_pg:
+            create_dsm(placement_group_names=[leaked_pg_name, alive_pg_name])
+
+        mock_get_pg.assert_called_once_with(leaked_pg_name)
+        mock_remove_pg.assert_called_once_with(mock_pg_obj)
 
 
 if __name__ == "__main__":

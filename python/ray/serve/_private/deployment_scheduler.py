@@ -1119,6 +1119,8 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
         # Flatten per-replica bundles to form a placement group to atomically reserve resources
         # required for each gang
         gang_pgs: List[PlacementGroup] = []
+        gang_ids: List[str] = []
+        gang_pg_names: List[str] = []
         for gang_index in range(num_gangs):
             if has_pg_bundles:
                 bundles = [
@@ -1151,10 +1153,11 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                 label_selector = None
                 fallback_strategy = None
 
+            gang_id = uuid.uuid4().hex[:8]
             pg_name = (
                 f"{GANG_PG_NAME_PREFIX}{deployment_id.app_name}"
                 f"_{deployment_id.name}"
-                f"_{gang_index}_{uuid.uuid4().hex[:8]}"
+                f"_{gang_index}_{gang_id}"
             )
 
             try:
@@ -1169,6 +1172,8 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                     )
                 )
                 gang_pgs.append(pg)
+                gang_ids.append(gang_id)
+                gang_pg_names.append(pg_name)
             except Exception:
                 # Follow the same pattern as single-replica PG creation failure:
                 # log and skip this gang so the controller can make progress with
@@ -1193,4 +1198,9 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
             f"Created {len(gang_pgs)} of {num_gangs} gang PG(s) for "
             f"{deployment_id}. Actors will wait for resource allocation."
         )
-        return GangReservationResult(success=True, gang_pgs=gang_pgs)
+        return GangReservationResult(
+            success=True,
+            gang_pgs=gang_pgs,
+            gang_ids=gang_ids,
+            gang_pg_names=gang_pg_names,
+        )
